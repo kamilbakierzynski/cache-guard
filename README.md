@@ -93,6 +93,16 @@ Everything the mod does leaves a dim line in the transcript, with ✓ or ✗:
 
 A line's cost comes from the session's cost ledger when it moved (`billed`), otherwise from the price list (`≈`). Pings never appear as messages: they are forks of the conversation that the model answers on the side.
 
+### A notification before the cache expires
+
+A minute before the cache lapses (adjustable from 30 s to 10 min), you get a system notification, so you can reply in time even from another window or another session:
+
+- **Watch, and Ping after its last ping:** `Prompt cache expires in 1 min`, with what the next reply will cost once it has: `≈ $1.25 instead of $0.05`.
+- **Compact and Ping → Compact:** `Compacting in 1 min`, so you can come back while the full context is still there.
+- **No notification:** while pings will keep the cache warm, below *Minimum context*, while Claude is working, or while the TTL is unknown. A new message cancels it.
+
+In a terminal it goes through Claude Code's own notification channel (`preferredNotifChannel`). The Claude desktop app has no terminal to notify through, so there cache-guard raises the system's own notification instead: a Windows toast through PowerShell, `osascript` on macOS, `notify-send` on Linux. Nothing has to be installed. If you have turned Claude Code's notifications off, cache-guard sends none.
+
 ### The settings panel
 
 Open it with **⚙ Settings** on the band or with the `/cache-guard` command. The command also prints a report: the current state, the price at your model, and the stats.
@@ -102,6 +112,7 @@ Open it with **⚙ Settings** on the band or with the `/cache-guard` command. Th
 - **Pings before compact.** 0–10, then ∞. At ∞ the panel says what an idle hour of pinging costs at your context and after how long that exceeds one re-cache.
 - **Act before expiry.** 10–180 s.
 - **Minimum context.** 10k–500k.
+- **Notification.** Turn the notification before expiry on or off, and set how early it comes: 30 s – 10 min.
 - **Compaction.** Pick the instruction profile and **edit its prompt in place**: type, then Enter to save. **Restore default** or an empty field brings back the default text. Edits are kept across sessions.
 - **Cost.** The price of your next reply on a warm and on an expired cache, at your model's list price.
 - **Savings.** This session and all sessions: lapses avoided, re-caching spared, money spent on pings and compactions, and the net.
@@ -136,6 +147,8 @@ Set at install, or later with `claude plugin configure cache-guard`.
 | `marginSeconds` | `30` | How long before expiry the ping or compaction runs |
 | `minTokens` | `50000` | Below this context size the mod only watches |
 | `toolPings` | `true` | Keep the cache warm while a long tool runs |
+| `notify` | `true` | A system notification shortly before the cache lapses or is compacted |
+| `notifySeconds` | `60` | How long before that the notification comes |
 | `profile` | `code` | Which compaction prompt is used: `code`, `debug` or `plan` |
 | `instructionsCode` | see below | Prompt of the `code` profile |
 | `instructionsDebug` | see below | Prompt of the `debug` profile |

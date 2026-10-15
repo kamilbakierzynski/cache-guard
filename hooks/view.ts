@@ -32,6 +32,8 @@ export const INITIAL_VIEW: GuardView = {
   session: NO_STATS,
   toolSince: null,
   toolPings: true,
+  notify: true,
+  notifyMs: 60_000,
   likelyTtl: null,
   model: null,
   isOff: false,
@@ -53,6 +55,14 @@ export const clockText = (ms: number): string => {
   if (ms > 10 * MINUTE) return `${Math.ceil(ms / MINUTE)} min`
   const s = Math.max(0, Math.ceil(ms / 1000))
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
+/** A span in words: `45 s`, `1 min`, `2 min 30 s`. */
+export const durationText = (ms: number): string => {
+  const s = Math.max(0, Math.round(ms / 1000))
+  const m = Math.floor(s / 60)
+  if (m === 0) return `${s} s`
+  return s % 60 === 0 ? `${m} min` : `${m} min ${s % 60} s`
 }
 
 /** Time gone by: m:ss under an hour, then hours and minutes. */

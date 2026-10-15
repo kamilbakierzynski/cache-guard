@@ -16,6 +16,14 @@ type World = {
   isBilled: boolean
   tokens: number
   forkRead: number
+  /** System notifications raised, as `title: text`. */
+  notices: string[]
+  /** Why the notification channel does not send, if it does not. */
+  notifyReason?: 'disabled' | 'no-channel' | 'no-surface' | 'refused'
+  /** Commands run on the host, each as its executable and the title it was given. */
+  runs: string[]
+  /** Executables the host has; the others fail to start. */
+  executables: string[]
 }
 
 const MIN = 60_000
@@ -29,7 +37,7 @@ const usage = (read: number, created: number): ModelUsage => ({
 
 /** The engine beneath the mod: a mocked clock and store, and a record of what the mod asked for. */
 function world(on: On, tokens = 100_000) {
-  const w: World = { toasts: [], logs: [], cost: 0, compacts: [], opened: [], forks: 0, isBilled: true, tokens, forkRead: 95_000 }
+  const w: World = { toasts: [], logs: [], cost: 0, compacts: [], opened: [], forks: 0, isBilled: true, tokens, forkRead: 95_000, notices: [], runs: [], executables: ['powershell.exe'] }
   const clock = mock.clock(on)
   mock.store(on)
   on('ui.toast', (_$, e) => {
@@ -37,6 +45,16 @@ function world(on: On, tokens = 100_000) {
     return { value: undefined }
   })
   on('ui.status', () => ({ value: undefined }))
+  on('process.run', (_$, e) => {
+    w.runs.push(`${e.argv[0]}: ${e.init?.env?.CACHE_GUARD_TITLE}`)
+    if (!w.executables.includes(e.argv[0] ?? '')) throw new Error(`${e.argv[0]}: not found`)
+    return { value: { exitCode: 0, stdout: '', stderr: '' } as never }
+  })
+  on('ui.notify', (_$, e) => {
+    if (w.notifyReason) return { value: { isSent: false as const, reason: w.notifyReason } }
+    w.notices.push(`${e.title}: ${e.text}`)
+    return { value: { isSent: true as const, channel: 'kitty' as const } }
+  })
   on('ui.log', (_$, e) => {
     w.logs.push(e.text)
     return { value: undefined }
@@ -651,6 +669,103 @@ describe('cache-guard', () => {
     expect(await band($)).toContain('3:00 left')
     await clock.advance(2 * MIN + 30_000)
     expect(w.compacts).toHaveLength(1)
+  })
+
+  test('a notification comes a minute before the cache expires', { options: { mode: 'watch', ttl: '5m' } }, async ($, on) => {
+    const { w, clock } = world(on)
+    await $.turn.complete(turnEnd('t1'))
+    await clock.advance(4 * MIN - 1000)
+    expect(w.notices).toEqual([])
+    await clock.advance(1000)
+    expect(w.notices).toEqual(['Prompt cache expires in 1 min: The next reply then re-writes 100k: ≈ $0.50 instead of $0.02.'])
+    await clock.advance(5 * MIN)
+    expect(w.notices).toHaveLength(1)
+  })
+
+  test('in Compact the notification comes before the compaction', { options: { mode: 'compact', ttl: '5m' } }, async ($, on) => {
+    const { w, clock } = world(on)
+    await $.turn.complete(turnEnd('t1'))
+    await clock.advance(3 * MIN + 30_000)
+    expect(w.notices).toEqual([
+      'Compacting in 1 min: cache-guard compacts 100k before the cache expires. Reply before then to keep the full context.',
+    ])
+    expect(w.compacts).toEqual([])
+  })
+
+  test('no notification while pings keep the cache, one after the last ping', { options: { mode: 'ping', ttl: '5m', maxPings: 1 } }, async ($, on) => {
+    const { w, clock } = world(on)
+    await $.turn.complete(turnEnd('t1'))
+    await clock.advance(4 * MIN + 30_000)
+    expect(w.forks).toBe(1)
+    expect(w.notices).toEqual([])
+    await clock.advance(4 * MIN)
+    expect(w.notices).toHaveLength(1)
+    expect(w.notices[0]).toContain('Prompt cache expires in 1 min:')
+  })
+
+  test('a new message cancels the notification', { options: { mode: 'watch', ttl: '5m' } }, async ($, on) => {
+    const { w, clock } = world(on)
+    await $.turn.complete(turnEnd('t1'))
+    await clock.advance(2 * MIN)
+    await $.turn.start({ text: 'next', turnId: 't2' })
+    await clock.advance(5 * MIN)
+    expect(w.notices).toEqual([])
+  })
+
+  test('no notification below the minimum context', { options: { mode: 'watch', ttl: '5m' } }, async ($, on) => {
+    const { w, clock } = world(on, 20_000)
+    await $.turn.complete(turnEnd('t1'))
+    await clock.advance(5 * MIN)
+    expect(w.notices).toEqual([])
+  })
+
+  test('the panel turns the notification off and sets how early it comes', { options: { mode: 'watch', ttl: '5m' } }, async ($, on) => {
+    const { w, clock } = world(on)
+    await $.turn.complete(turnEnd('t1'))
+    const at = { plugin: 'cache-guard', surface: 'desktop' as const, requestId: 'cache-guard-settings' }
+    await $.ui.mount({ plugin: 'cache-guard', surface: 'desktop', component: 'Pane', requestId: 'cache-guard-settings', props: PANE })
+    await $.ui.press({ ...at, key: 'inc-notifyLead' })
+    expect(await report($)).toContain('notification: 1 min 30 s before the cache expires or is compacted')
+    await clock.advance(3 * MIN + 30_000)
+    expect(w.notices).toHaveLength(1)
+    expect(w.notices[0]).toContain('Prompt cache expires in 1 min 30 s:')
+
+    await $.turn.start({ text: 'next', turnId: 't2' })
+    await $.turn.complete(turnEnd('t2'))
+    await $.ui.press({ ...at, key: 'set-notify-off' })
+    expect(await report($)).toContain('notification: off')
+    await clock.advance(5 * MIN)
+    expect(w.notices).toHaveLength(1)
+  })
+
+  test('with no terminal to notify through the system notifies', { options: { mode: 'watch', ttl: '5m' } }, async ($, on) => {
+    const { w, clock } = world(on)
+    w.notifyReason = 'no-surface'
+    await $.turn.complete(turnEnd('t1'))
+    await clock.advance(4 * MIN)
+    expect(w.runs).toEqual(['powershell.exe: Prompt cache expires in 1 min'])
+    expect(w.toasts).toEqual([])
+  })
+
+  test('the first system notifier that works is kept', { options: { mode: 'watch', ttl: '5m' } }, async ($, on) => {
+    const { w, clock } = world(on)
+    w.notifyReason = 'no-surface'
+    w.executables = ['osascript']
+    await $.turn.complete(turnEnd('t1'))
+    await clock.advance(4 * MIN)
+    expect(w.runs).toEqual(['powershell.exe: Prompt cache expires in 1 min', 'osascript: Prompt cache expires in 1 min'])
+    await $.turn.start({ text: 'next', turnId: 't2' })
+    await $.turn.complete(turnEnd('t2'))
+    await clock.advance(4 * MIN)
+    expect(w.runs.slice(2)).toEqual(['osascript: Prompt cache expires in 1 min'])
+  })
+
+  test('notifications turned off in the person\'s settings stay off', { options: { mode: 'watch', ttl: '5m' } }, async ($, on) => {
+    const { w, clock } = world(on)
+    w.notifyReason = 'disabled'
+    await $.turn.complete(turnEnd('t1'))
+    await clock.advance(5 * MIN)
+    expect(w.runs).toEqual([])
   })
 
   test('/cache-guard opens the settings and reports the stats', { options: { mode: 'compact', ttl: '5m' } }, async ($, on) => {

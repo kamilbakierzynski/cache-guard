@@ -47,6 +47,10 @@ export type GuardView = {
   toolSince: number | null
   /** Whether the cache is kept warm while a long tool runs. */
   toolPings: boolean
+  /** Whether a system notification comes shortly before the cache lapses or is compacted. */
+  notify: boolean
+  /** How long before that the notification comes. */
+  notifyMs: number
   /** The TTL this session most likely has, as a hint while it is unknown. */
   likelyTtl: Ttl | null
   /** The main loop's model as the last reply named it; prices the cache. */

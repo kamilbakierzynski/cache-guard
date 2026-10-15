@@ -1,6 +1,6 @@
 {
   "name": "cache-guard",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Counts down to prompt-cache expiry and, just before it, keeps the cache warm with a ping or compacts the conversation, so a long context is not re-written at full price.",
   "author": {
     "name": "Kamil Bakierzyński",
@@ -63,6 +63,18 @@
       "title": "Keep warm during long tools",
       "description": "Ping while a tool in the main loop outlasts the cache, as long as that stays cheaper than re-caching",
       "default": true
+    },
+    "notify": {
+      "type": "boolean",
+      "title": "Notify before expiry",
+      "description": "A system notification shortly before the cache lapses or is compacted, so you can reply in time",
+      "default": true
+    },
+    "notifySeconds": {
+      "type": "number",
+      "title": "Notify how early (seconds)",
+      "description": "How long before the cache expires, or before the compaction, the notification comes",
+      "default": 60
     },
     "profile": {
       "type": "string",

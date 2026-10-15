@@ -6,6 +6,7 @@ import {
   bandParts,
   cacheCost,
   callCost,
+  durationText,
   INITIAL_VIEW,
   kTokens,
   line,
@@ -34,6 +35,10 @@ type Settings = {
   minTokens: number
   /** Keep the cache warm with pings while a long tool runs in the main loop. */
   toolPings: boolean
+  /** Raise a system notification shortly before the cache lapses or is compacted. */
+  notify: boolean
+  /** How long before that. */
+  notifyMs: number
 }
 
 /** A pause long enough to tell a 5m cache from a 1h one, waiting for the next turn's usage. */
@@ -62,6 +67,10 @@ type Guard = Settings & {
   probe?: Probe
   tick?: Timer
   fire?: Timer
+  /** The notification before the cache lapses or is compacted. */
+  notice?: Timer
+  /** Which of the system's own notifiers worked last, where the terminal cannot notify. */
+  notifier?: number
   /** This session's stats; `stats` holds all sessions'. */
   session: GuardStats
   likelyTtl?: Ttl
@@ -120,8 +129,20 @@ const INSTRUCTIONS: Record<GuardProfile, string> = {
     'open questions for the user; agreed plan steps and status. No code snippets or file contents; reference paths only.',
 }
 
-/** The numeric settings the panel steps through. */
-const STEPPERS = [
+/** A numeric setting the panel steps through. */
+type Stepper = {
+  key: string
+  label: string
+  hint: string
+  min: number
+  max: number
+  step: number
+  get: (v: GuardView) => number
+  set: (n: number) => Partial<Settings>
+  show: (n: number) => string
+}
+
+const STEPPERS: readonly Stepper[] = [
   {
     key: 'maxPings',
     label: 'Pings before compact',
@@ -155,9 +176,45 @@ const STEPPERS = [
     set: (n: number): Partial<Settings> => ({ minTokens: n }),
     show: kTokens,
   },
-] as const
+]
+
+const NOTIFY_STEPPER: Stepper = {
+  key: 'notifyLead',
+  label: 'Notify how early',
+  hint: 'How long before the cache expires, or before the compaction, the notification comes.',
+  min: 30_000,
+  max: 600_000,
+  step: 30_000,
+  get: v => v.notifyMs,
+  set: n => ({ notifyMs: n }),
+  show: durationText,
+}
 
 const PING_PROMPT = 'Automated cache keep-alive, not a message from the user. Reply with exactly: ok'
+
+/** A Windows toast from PowerShell's own app id, so nothing has to be installed or registered. */
+const WINDOWS_TOAST =
+  '$m=[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime];' +
+  '$x=$m::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);' +
+  "$t=$x.GetElementsByTagName('text');" +
+  '$null=$t.Item(0).AppendChild($x.CreateTextNode($env:CACHE_GUARD_TITLE));' +
+  '$null=$t.Item(1).AppendChild($x.CreateTextNode($env:CACHE_GUARD_BODY));' +
+  "$m::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe')" +
+  '.Show([Windows.UI.Notifications.ToastNotification]::new($x))'
+
+/**
+ * The system's own notifiers, tried in turn where no terminal can notify (the desktop app): Windows, macOS, Linux.
+ * The text travels in the environment or as plain arguments, never through a shell.
+ */
+const NATIVE_NOTIFIERS: readonly ((title: string, body: string) => string[])[] = [
+  () => ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', WINDOWS_TOAST],
+  () => [
+    'osascript',
+    '-e',
+    'display notification (system attribute "CACHE_GUARD_BODY") with title (system attribute "CACHE_GUARD_TITLE")',
+  ],
+  (title, body) => ['notify-send', '--app-name=cache-guard', title, body],
+]
 
 const pick = <T extends string>(value: unknown, allowed: readonly T[], fallback: T): T =>
   allowed.includes(value as T) ? (value as T) : fallback
@@ -182,6 +239,8 @@ const settingsOf = (g: Guard): Settings => ({
   marginMs: g.marginMs,
   minTokens: g.minTokens,
   toolPings: g.toolPings,
+  notify: g.notify,
+  notifyMs: g.notifyMs,
 })
 
 /** Settings read from the options or the store, each checked and falling back to `base`. */
@@ -193,6 +252,8 @@ const settingsFrom = (raw: Partial<Record<keyof Settings, unknown>>, base: Setti
   marginMs: clamp(num(raw.marginMs, base.marginMs), 0, 600_000),
   minTokens: num(raw.minTokens, base.minTokens),
   toolPings: typeof raw.toolPings === 'boolean' ? raw.toolPings : base.toolPings,
+  notify: typeof raw.notify === 'boolean' ? raw.notify : base.notify,
+  notifyMs: clamp(num(raw.notifyMs, base.notifyMs), 0, 3_600_000),
 })
 
 const nextAction = (g: Guard): 'ping' | 'compact' | null => {
@@ -220,6 +281,8 @@ function stopTick(g: Guard) {
 function unschedule(g: Guard) {
   g.fire?.cancel()
   g.fire = undefined
+  g.notice?.cancel()
+  g.notice = undefined
 }
 
 async function publish($: EngineInterface, g: Guard) {
@@ -242,6 +305,8 @@ async function publish($: EngineInterface, g: Guard) {
     session: g.session,
     toolSince: g.toolSince ?? null,
     toolPings: g.toolPings,
+    notify: g.notify,
+    notifyMs: g.notifyMs,
     likelyTtl: g.likelyTtl ?? null,
     model: g.model ?? null,
     isOff: g.isOff,
@@ -339,14 +404,56 @@ async function settle($: EngineInterface, g: Guard, usage: ModelUsage) {
   await count($, g, { pingMisses: 1 })
 }
 
-/** Sets the action for the margin before the warm cache lapses, as the mode and TTL now stand. */
+/** Sets the action for the margin before the warm cache lapses, and the notification ahead of it. */
 async function schedule($: EngineInterface, g: Guard) {
   unschedule(g)
   const known = ttlOf(g)
-  if (g.isOff || g.warmAt === undefined || g.isWorking || known === undefined || nextAction(g) === null) return
+  if (g.isOff || g.warmAt === undefined || g.isWorking || known === undefined) return
   const left = g.warmAt + TTL_MS[known] - (await $.clock.now())
   if (left <= 0) return
-  g.fire = $.clock.after(Math.max(0, left - g.marginMs), () => void act($, g))
+  const action = nextAction(g)
+  if (action !== null) g.fire = $.clock.after(Math.max(0, left - g.marginMs), () => void act($, g))
+  // A ping keeps the cache, so only the lapse or the compaction after the last one is worth a notification.
+  if (!g.notify || action === 'ping' || g.context < g.minTokens) return
+  const until = action === 'compact' ? left - g.marginMs : left
+  if (until > 0) g.notice = $.clock.after(Math.max(0, until - g.notifyMs), () => void notify($, g))
+}
+
+/** Tells the person, through their notification channel, that the cache is about to lapse or be compacted. */
+async function notify($: EngineInterface, g: Guard) {
+  g.notice = undefined
+  const known = ttlOf(g)
+  if (g.isOff || g.isWorking || g.warmAt === undefined || known === undefined) return
+  const left = g.warmAt + TTL_MS[known] - (await $.clock.now())
+  const isCompact = nextAction(g) === 'compact'
+  const until = isCompact ? left - g.marginMs : left
+  if (until <= 0) return
+  const cost = costOf(g)
+  const title = isCompact ? `Compacting in ${durationText(until)}` : `Prompt cache expires in ${durationText(until)}`
+  const body = isCompact
+    ? `cache-guard compacts ${kTokens(g.context)} before the cache expires. Reply before then to keep the full context.`
+    : `The next reply then re-writes ${kTokens(g.context)}: ≈ ${usdText(cost.cold)} instead of ${usdText(cost.warm)}.`
+  const sent = await $.ui.notify(body, { title }).catch(() => ({ isSent: false as const, reason: 'refused' as const }))
+  // No terminal to notify through (the desktop app), or none that notifies: the system's own notification
+  // reaches the person in another session or another window too.
+  if (!sent.isSent && (sent.reason === 'no-surface' || sent.reason === 'no-channel')) await nativeNotify($, g, title, body)
+}
+
+/** Raises the notification with the first of the system's notifiers that works, starting with the last one that did. */
+async function nativeNotify($: EngineInterface, g: Guard, title: string, body: string) {
+  const env = { CACHE_GUARD_TITLE: title, CACHE_GUARD_BODY: body }
+  const order = NATIVE_NOTIFIERS.map((make, i) => ({ make, i }))
+  order.sort((a, b) => Number(b.i === g.notifier) - Number(a.i === g.notifier))
+  for (const { make, i } of order) {
+    const isShown = await $.process
+      .run(make(title, body), { env, timeoutMs: 15_000 })
+      .then(done => done.exitCode === 0)
+      .catch(() => false)
+    if (isShown) {
+      g.notifier = i
+      return
+    }
+  }
 }
 
 /** Starts guarding a cache touched at `at`. */
@@ -558,6 +665,7 @@ async function report($: EngineInterface, g: Guard): Promise<string> {
     `session: ${g.isOff ? 'off (this session only)' : 'on'}`,
     `mode: ${MODE_LABELS[g.mode]} · TTL: ${ttlText} · pings before compact: ${pingLimitText(g.maxPings)} · ` +
       `act ${g.marginMs / 1000}s before expiry · minimum ${kTokens(g.minTokens)}`,
+    `notification: ${g.notify ? `${durationText(g.notifyMs)} before the cache expires or is compacted` : 'off'}`,
     `now: ${line({ ...v, now: await $.clock.now() })}`,
     `cost at ${cost.name ?? 'an assumed'} API price: next reply ≈ ${usdText(cost.warm)} while warm, ≈ ${usdText(cost.cold)} after expiry`,
     `compact profile: ${g.profile} — ${g.instructions[g.profile]}`,
@@ -666,8 +774,20 @@ export const register: Register = (on, options) => {
       marginMs: num(options.marginSeconds, 30) * 1000,
       minTokens: options.minTokens,
       toolPings: options.toolPings,
+      notify: options.notify,
+      notifyMs: num(options.notifySeconds, 60) * 1000,
     },
-    { mode: 'compact', ttlOption: 'auto', profile: 'code', maxPings: 2, marginMs: 30_000, minTokens: 50_000, toolPings: true },
+    {
+      mode: 'compact',
+      ttlOption: 'auto',
+      profile: 'code',
+      maxPings: 2,
+      marginMs: 30_000,
+      minTokens: 50_000,
+      toolPings: true,
+      notify: true,
+      notifyMs: 60_000,
+    },
   )
   const optionInstructions: Record<GuardProfile, string> = {
     code: text(options.instructionsCode, INSTRUCTIONS.code),
@@ -841,6 +961,28 @@ export const register: Register = (on, options) => {
         : '∞ while idle: the hourly cost shows after the first reply. Ping → Compact never compacts.'
     // Each row wraps its controls under its label when the panel is narrow.
     const row = { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', columnGap: 2, rowGap: 1 } as const
+    const stepRow = (s: Stepper) => (
+      <Box {...row}>
+        <Box flexDirection="column" flexShrink={1}>
+          <Text>{s.label}</Text>
+          <Text dimColor>{s.hint}</Text>
+          {s.key === 'maxPings' && v.maxPings >= UNLIMITED_PINGS ? <Text color="warning">{unlimitedHint}</Text> : null}
+        </Box>
+        <Box flexDirection="row" alignItems="center" columnGap={1}>
+          <Button
+            key={`dec-${s.key}`}
+            label="−"
+            onPress={() => changeSettings($, g, s.set(Math.max(s.min, s.get(v) - s.step)))}
+          />
+          <Text bold>{s.show(s.get(v))}</Text>
+          <Button
+            key={`inc-${s.key}`}
+            label="+"
+            onPress={() => changeSettings($, g, s.set(Math.min(s.max, s.get(v) + s.step)))}
+          />
+        </Box>
+      </Box>
+    )
 
     return (
       <Box flexDirection="column" paddingX={1} rowGap={1}>
@@ -918,28 +1060,33 @@ export const register: Register = (on, options) => {
           </Box>
         </Box>
 
-        {STEPPERS.map(s => (
-          <Box {...row}>
-            <Box flexDirection="column" flexShrink={1}>
-              <Text>{s.label}</Text>
-              <Text dimColor>{s.hint}</Text>
-              {s.key === 'maxPings' && v.maxPings >= UNLIMITED_PINGS ? <Text color="warning">{unlimitedHint}</Text> : null}
-            </Box>
-            <Box flexDirection="row" alignItems="center" columnGap={1}>
-              <Button
-                key={`dec-${s.key}`}
-                label="−"
-                onPress={() => changeSettings($, g, s.set(Math.max(s.min, s.get(v) - s.step)))}
-              />
-              <Text bold>{s.show(s.get(v))}</Text>
-              <Button
-                key={`inc-${s.key}`}
-                label="+"
-                onPress={() => changeSettings($, g, s.set(Math.min(s.max, s.get(v) + s.step)))}
-              />
-            </Box>
+        {STEPPERS.map(stepRow)}
+
+        <Text bold>Notification</Text>
+        <Box {...row}>
+          <Box flexDirection="column" flexShrink={1}>
+            <Text>Notify before expiry</Text>
+            <Text dimColor>
+              A system notification before the cache lapses, or before the compaction, so you can reply in time. None while
+              pings keep the cache warm. Without a terminal that notifies (the desktop app) it is the system's own notification.
+            </Text>
           </Box>
-        ))}
+          <Box flexDirection="row" columnGap={1}>
+            <Button
+              key="set-notify-on"
+              label="On"
+              variant={v.notify ? 'primary' : 'secondary'}
+              onPress={() => changeSettings($, g, { notify: true })}
+            />
+            <Button
+              key="set-notify-off"
+              label="Off"
+              variant={v.notify ? 'secondary' : 'primary'}
+              onPress={() => changeSettings($, g, { notify: false })}
+            />
+          </Box>
+        </Box>
+        {v.notify ? stepRow(NOTIFY_STEPPER) : null}
 
         <Text bold>Compaction</Text>
         <Box {...row}>
