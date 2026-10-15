@@ -1,0 +1,98 @@
+{
+  "name": "cache-guard",
+  "version": "0.6.0",
+  "description": "Counts down to prompt-cache expiry and, just before it, keeps the cache warm with a ping or compacts the conversation, so a long context is not re-written at full price.",
+  "author": {
+    "name": "Kamil Bakierzyński",
+    "url": "https://github.com/kamilbakierzynski"
+  },
+  "homepage": "https://github.com/kamilbakierzynski/cache-guard",
+  "repository": "https://github.com/kamilbakierzynski/cache-guard",
+  "license": "MIT",
+  "keywords": [
+    "prompt-cache",
+    "cost",
+    "compact",
+    "ping",
+    "mod"
+  ],
+  "userConfig": {
+    "mode": {
+      "type": "string",
+      "title": "Mode",
+      "description": "watch = only count down; ping = keep the cache warm with tiny forked questions; compact = compact just before expiry; ping+compact = pings first, then compact. The band and the settings panel override this.",
+      "default": "compact",
+      "options": [
+        "watch",
+        "ping",
+        "compact",
+        "ping+compact"
+      ]
+    },
+    "ttl": {
+      "type": "string",
+      "title": "Cache TTL",
+      "description": "auto = learn it from the session and only count down until then; 5m or 1h = set by hand",
+      "default": "auto",
+      "options": [
+        "auto",
+        "5m",
+        "1h"
+      ]
+    },
+    "maxPings": {
+      "type": "number",
+      "title": "Pings before compact",
+      "description": "Keep-alive pings in one pause, 11 or more for no limit; ping+compact compacts after the last one",
+      "default": 2
+    },
+    "marginSeconds": {
+      "type": "number",
+      "title": "Act before expiry (seconds)",
+      "description": "How long before the cache expires the ping or compact runs",
+      "default": 30
+    },
+    "minTokens": {
+      "type": "number",
+      "title": "Minimum context (tokens)",
+      "description": "Below this the mod only watches",
+      "default": 50000
+    },
+    "toolPings": {
+      "type": "boolean",
+      "title": "Keep warm during long tools",
+      "description": "Ping while a tool in the main loop outlasts the cache, as long as that stays cheaper than re-caching",
+      "default": true
+    },
+    "profile": {
+      "type": "string",
+      "title": "Compact instruction profile",
+      "description": "Which text below a compaction is given",
+      "default": "code",
+      "options": [
+        "code",
+        "debug",
+        "plan"
+      ]
+    },
+    "instructionsCode": {
+      "type": "string",
+      "title": "Instructions: code",
+      "description": "General profile for coding work; the settings panel can edit it over this text",
+      "default": "Keep it tight: pointers over content. Preserve: user's corrections/preferences/limits quoted verbatim; decisions + why; approaches ruled out (1 line each); exact paths, symbols, commands, failing test names, error text; uncommitted/unverified changes; todo state; exact next step. Drop: tool output, code already on disk, resolved debugging detail."
+    },
+    "instructionsDebug": {
+      "type": "string",
+      "title": "Instructions: debug",
+      "description": "For debugging sessions; the settings panel can edit it over this text",
+      "default": "Debug focus: symptom + exact repro command; current hypothesis and its evidence; hypotheses ruled out + why (1 line each); exact error text, failing tests, file:line; temporary instrumentation to revert. Drop raw logs and resolved branches."
+    },
+    "instructionsPlan": {
+      "type": "string",
+      "title": "Instructions: plan",
+      "description": "For planning and design sessions; the settings panel can edit it over this text",
+      "default": "Design focus: goal, constraints and user's preferences verbatim; options considered: chosen + why, rejected + why; open questions for the user; agreed plan steps and status. No code snippets or file contents; reference paths only."
+    }
+  },
+  "types": "./types/index.d.ts"
+}

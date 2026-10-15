@@ -1,0 +1,15 @@
+{
+  "name": "cache-guard",
+  "description": "cache-guard: a Claude Code mod that keeps the prompt cache warm or compacts before it expires, and shows what that saves.",
+  "owner": {
+    "name": "Kamil Bakierzyński",
+    "url": "https://github.com/kamilbakierzynski"
+  },
+  "plugins": [
+    {
+      "name": "cache-guard",
+      "source": "./",
+      "description": "Counts down to prompt-cache expiry and keeps the cache warm with pings or compacts the conversation just before it lapses."
+    }
+  ]
+}
