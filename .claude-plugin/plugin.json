@@ -1,6 +1,6 @@
 {
   "name": "cache-guard",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Counts down to prompt-cache expiry and, just before it, keeps the cache warm with a ping or compacts the conversation, so a long context is not re-written at full price.",
   "author": {
     "name": "Kamil Bakierzyński",

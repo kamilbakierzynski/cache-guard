@@ -51,6 +51,9 @@ export type GuardView = {
   notify: boolean
   /** How long before that the notification comes. */
   notifyMs: number
+  /** The TTL learned for this session under `auto`, and how: measured, configured, reported or from a pause. */
+  learnedTtl: Ttl | null
+  ttlSource: string | null
   /** The TTL this session most likely has, as a hint while it is unknown. */
   likelyTtl: Ttl | null
   /** The main loop's model as the last reply named it; prices the cache. */

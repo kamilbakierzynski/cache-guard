@@ -17,6 +17,7 @@ import {
   savingsText,
   statsLine,
   TTL_MS,
+  ttlFromBill,
   UNLIMITED_PINGS,
   usdText,
 } from './view'
@@ -51,6 +52,10 @@ type Guard = Settings & {
   /** Each profile's text as the options set it, the built-in one where left empty. */
   optionInstructions: Record<GuardProfile, string>
   learnedTtl?: Ttl
+  /** How `learnedTtl` was found, for the report and the panel. */
+  ttlSource?: string
+  /** The TTL the last requests' bills showed, and how many in a row showed it. */
+  billTtl?: { ttl: Ttl; count: number }
   stats: GuardStats
   isWorking: boolean
   lastReplyAt?: number
@@ -236,6 +241,33 @@ const text = (value: unknown, fallback: string): string =>
 
 const asTtl = (value: unknown): Ttl | undefined => (value === '5m' || value === '1h' ? value : undefined)
 
+/** An environment flag as Claude Code reads one. */
+const isOn = (value: string | undefined): boolean =>
+  value !== undefined && ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase())
+
+/**
+ * The TTL Claude Code's own configuration fixes for the main conversation, checked in the engine's order;
+ * undefined where its automatic choice applies (1 hour on a subscription within its limits, else 5 minutes).
+ */
+async function configuredTtl($: EngineInterface): Promise<{ ttl: Ttl; source: string } | undefined> {
+  if (isOn(await $.env.get('FORCE_PROMPT_CACHING_5M'))) return { ttl: '5m', source: 'set by FORCE_PROMPT_CACHING_5M' }
+  const env = asTtl(await $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL'))
+  if (env) return { ttl: env, source: 'set by CLAUDE_CODE_PROMPT_CACHE_TTL' }
+  const settings = (await $.settings.read().catch(() => ({}))) as { promptCacheTtl?: unknown }
+  const setting = asTtl(settings.promptCacheTtl)
+  if (setting) return { ttl: setting, source: 'set by the promptCacheTtl setting' }
+  if (isOn(await $.env.get('ENABLE_PROMPT_CACHING_1H'))) return { ttl: '1h', source: 'set by ENABLE_PROMPT_CACHING_1H' }
+  const isBedrock = isOn(await $.env.get('CLAUDE_CODE_USE_BEDROCK'))
+  if (isBedrock && isOn(await $.env.get('ENABLE_PROMPT_CACHING_1H_BEDROCK'))) {
+    return { ttl: '1h', source: 'set by ENABLE_PROMPT_CACHING_1H_BEDROCK' }
+  }
+  if (isBedrock || isOn(await $.env.get('CLAUDE_CODE_USE_VERTEX')) || isOn(await $.env.get('CLAUDE_CODE_USE_FOUNDRY'))) {
+    return { ttl: '5m', source: 'Bedrock, Vertex and Foundry cache for 5 min' }
+  }
+
+  return undefined
+}
+
 const ttlOf = (g: Guard): Ttl | undefined => (g.ttlOption === 'auto' ? g.learnedTtl : g.ttlOption)
 
 const settingsOf = (g: Guard): Settings => ({
@@ -314,6 +346,8 @@ async function publish($: EngineInterface, g: Guard) {
     toolPings: g.toolPings,
     notify: g.notify,
     notifyMs: g.notifyMs,
+    learnedTtl: g.learnedTtl ?? null,
+    ttlSource: g.ttlSource ?? null,
     likelyTtl: g.likelyTtl ?? null,
     model: g.model ?? null,
     isOff: g.isOff,
@@ -327,12 +361,20 @@ function startTick($: EngineInterface, g: Guard) {
   if (!g.tick && !g.isOff) g.tick = $.clock.every(1000, () => void publish($, g))
 }
 
-async function learn($: EngineInterface, g: Guard, value: Ttl | undefined) {
+/** Takes the TTL the latest evidence shows; the session can change it (a subscription past its limits caches for 5 min). */
+async function learn($: EngineInterface, g: Guard, value: Ttl | undefined, source: string) {
   if (value === undefined || g.learnedTtl === value) return
   g.learnedTtl = value
-  await $.store.set('learnedTtl', value)
-  if (g.ttlOption === 'auto') $.ui.toast(`cache-guard: this session's cache TTL is ${value}`)
+  g.ttlSource = source
+  if (g.ttlOption === 'auto') $.ui.toast(`cache-guard: this session's cache TTL is ${value} (${source})`)
   await schedule($, g)
+}
+
+/** Learns the TTL once two requests in a row were billed at the same cache-write rate. */
+async function measured($: EngineInterface, g: Guard, ttl: Ttl | null) {
+  if (ttl === null) return
+  g.billTtl = g.billTtl?.ttl === ttl ? { ttl, count: g.billTtl.count + 1 } : { ttl, count: 1 }
+  if (g.billTtl.count >= 2) await learn($, g, ttl, 'measured from the cache-write price')
 }
 
 const added = (s: GuardStats, change: Partial<GuardStats>): GuardStats => {
@@ -622,11 +664,15 @@ async function toolEnds($: EngineInterface, g: Guard) {
   await publish($, g)
 }
 
-/** A main-loop model request: its usage names the model and the context, and settles what the mod spared. */
-async function stepped($: EngineInterface, g: Guard, usage: TurnUsage | null) {
+/**
+ * A main-loop model request: its usage names the model and the context, its bill the TTL its cache writes had,
+ * and it settles what the mod spared.
+ */
+async function stepped($: EngineInterface, g: Guard, usage: TurnUsage | null, billed: number | null) {
   if (!usage) return
   g.model = usage.model
-  if (g.probe) await learn($, g, ttlFromProbe(g.probe, usage))
+  if (billed !== null) await measured($, g, ttlFromBill(usage.model, usage, billed))
+  if (g.probe) await learn($, g, ttlFromProbe(g.probe, usage), 'learned from a pause')
   g.probe = undefined
   await settle($, g, usage)
   g.context = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
@@ -683,7 +729,8 @@ async function current($: EngineInterface): Promise<GuardView> {
 
 async function report($: EngineInterface, g: Guard): Promise<string> {
   const v = await current($)
-  const ttlText = g.ttlOption === 'auto' ? `auto (${g.learnedTtl ?? 'not known yet'})` : g.ttlOption
+  const ttlText =
+    g.ttlOption === 'auto' ? `auto (${g.learnedTtl ? `${g.learnedTtl}, ${g.ttlSource}` : 'not known yet'})` : g.ttlOption
   const cost = cacheCost(g.model ?? null, g.context, ttlOf(g) ?? null)
   const lines = [
     `session: ${g.isOff ? 'off (this session only)' : 'on'}`,
@@ -724,7 +771,6 @@ async function restore($: EngineInterface, g: Guard) {
   g.link = host && /^local_[A-Za-z0-9-]{1,64}$/.test(host) ? `claude://code/continue?session=${host}&source=cache-guard` : undefined
   Object.assign(g, settingsFrom((await $.store.get('settings')) ?? {}, settingsOf(g)))
   await loadInstructions($, g)
-  g.learnedTtl = asTtl(await $.store.get('learnedTtl'))
   g.stats = { ...NO_STATS, ...((await $.store.get('stats')) as Partial<GuardStats> | undefined) }
 
   // A reload keeps the session's state but not this module's: pick the countdown up where it was.
@@ -733,6 +779,14 @@ async function restore($: EngineInterface, g: Guard) {
   g.model = v.model ?? undefined
   g.session = { ...NO_STATS, ...v.session }
   g.likelyTtl = v.likelyTtl ?? undefined
+  // The TTL is the session's own: what this session learned, else what Claude Code's configuration fixes.
+  g.learnedTtl = v.learnedTtl ?? undefined
+  g.ttlSource = v.ttlSource ?? undefined
+  const configured = g.learnedTtl ? undefined : await configuredTtl($)
+  if (configured) {
+    g.learnedTtl = configured.ttl
+    g.ttlSource = configured.source
+  }
   if (v.lastReplyAt === null) return publish($, g)
   g.context = v.context
   g.note = v.note
@@ -766,7 +820,7 @@ async function turnStarts($: EngineInterface, g: Guard) {
 }
 
 async function turnEnds($: EngineInterface, g: Guard, usage: TurnUsage | undefined) {
-  if (g.probe && usage) await learn($, g, ttlFromProbe(g.probe, usage))
+  if (g.probe && usage) await learn($, g, ttlFromProbe(g.probe, usage), 'learned from a pause')
   if (usage?.model) g.model = usage.model
   if (usage) await settle($, g, usage)
   g.probe = undefined
@@ -775,8 +829,9 @@ async function turnEnds($: EngineInterface, g: Guard, usage: TurnUsage | undefin
   g.toolSince = undefined
   const measured = await $.session.usage()
   g.context = measured.context.tokens ?? 0
-  // Usage limits are reported on a subscription alone, which most often caches for an hour.
-  g.likelyTtl = measured.rateLimits.length > 0 ? '1h' : '5m'
+  // Usage limits are reported on a subscription alone, which caches for an hour until it runs past them.
+  const isWithinLimits = measured.rateLimits.length > 0 && measured.rateLimits.every(limit => limit.percentUsed < 100)
+  g.likelyTtl = isWithinLimits ? '1h' : '5m'
   g.pings = 0
   g.hasActed = false
   g.note = ''
@@ -872,8 +927,10 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     if (e.agentId !== undefined) return yield* next(e)
     g.requestAt = await $.clock.now()
+    const before = (await $.session.usage()).cost?.usd
     const response = yield* next(e)
-    await stepped($, g, response.usage)
+    const after = (await $.session.usage()).cost?.usd
+    await stepped($, g, response.usage, before === undefined || after === undefined ? null : after - before)
 
     return response
   })
@@ -897,13 +954,13 @@ export const register: Register = (on, options) => {
 
   on('classic.PreCompact', async ($, e, next) => {
     // Newer engines pass the session's cache TTL here; older ones leave it out.
-    await learn($, g, asTtl((e as { cache_ttl?: unknown }).cache_ttl))
+    await learn($, g, asTtl((e as { cache_ttl?: unknown }).cache_ttl), 'reported by Claude Code')
 
     return next(e)
   }).catch(($, e, next) => next(e))
 
   on('classic.PreModelSwitch', async ($, e, next) => {
-    await learn($, g, e.cache_ttl)
+    await learn($, g, e.cache_ttl, 'reported by Claude Code')
 
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -974,7 +1031,7 @@ export const register: Register = (on, options) => {
     // Every surface but mobile draws a field.
     const Input = 'Input' in elements ? elements.Input : undefined
     const isEdited = g.instructions[v.profile] !== g.optionInstructions[v.profile]
-    const learned = v.ttlOption === 'auto' ? (v.ttl ? `learned: ${v.ttl}` : 'not learned yet') : undefined
+    const learned = v.ttlOption === 'auto' ? (v.ttl ? `${v.ttl}, ${v.ttlSource ?? 'learned'}` : 'not learned yet') : undefined
     const cost = cacheCost(v.model, v.context, v.ttl)
     const rates = cost.rates
     // Unlimited pings keep an idle session warm for good: say what an hour of that costs against one re-cache.

@@ -75,7 +75,7 @@ claude plugin uninstall cache-guard
   - **Profile** cycles the compaction prompt (Code → Debug → Plan).
   - **⚙ Settings** opens the panel.
   - **Off** turns the mod off for this session.
-- **Unknown TTL.** The band asks **Pick the cache TTL** and offers `TTL 5 min` / `TTL 1 hour` until it learns the TTL. It highlights the likely one: a subscription (usage limits reported) usually has 1 hour, an API key 5 minutes.
+- **Unknown TTL.** The band asks **Pick the cache TTL** and offers `TTL 5 min` / `TTL 1 hour` until it learns the TTL. It highlights the likely one: a subscription within its usage limits usually has 1 hour, an API key or a subscription past its limits 5 minutes. Under `auto` this rarely shows for long: the mod measures the TTL from the first replies' bills (see [How it works](#how-it-works)).
 
 ### Lines in the conversation
 
@@ -146,7 +146,7 @@ Set at install, or later with `claude plugin configure cache-guard`.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `mode` | `compact` | `watch`, `ping`, `compact` or `ping+compact` |
-| `ttl` | `auto` | `auto` learns the session's TTL and only counts down until it does; `5m` or `1h` set it by hand |
+| `ttl` | `auto` | `auto` finds the session's TTL (measured, configured or reported) and only counts down until it does; `5m` or `1h` set it by hand |
 | `maxPings` | `2` | Keep-alive pings in one pause; `11` or more means unlimited |
 | `marginSeconds` | `30` | How long before expiry the ping or compaction runs |
 | `minTokens` | `50000` | Below this context size the mod only watches |
@@ -170,9 +170,13 @@ Claude Code's own automatic compaction does not receive these prompts. To steer 
 
 ## How it works
 
-- **TTL.** The mod reads the session's cache TTL from Claude Code where the engine reports it: before a compaction or a model switch. Otherwise it learns the TTL from the first request after a pause of 5–60 minutes, or after a tool that ran that long without pings.
-  - If that request had to write most of the context again, the TTL is 5 minutes.
-  - If it read the context from the cache, the TTL is 1 hour.
+- **TTL.** Under `auto` the mod finds the session's cache TTL itself, usually within the first replies. The TTL belongs to the session: it is not carried over from earlier sessions. `/cache-guard` and the panel say where it came from. The sources, strongest first:
+  - **Reported by Claude Code.** The engine passes the TTL before a compaction or a model switch.
+  - **Measured from the cache-write price.** The engine does not tell a mod whether a request's cache writes were for 5 minutes or 1 hour, but it bills them at that rate, and a 1-hour write costs 1.6× a 5-minute one. After every request in the main conversation, the mod compares how far the session's cost moved with what the request would cost at either rate, allowing for a 10% regional surcharge. Two requests in a row at the same rate set the TTL. A request that wrote under 500 tokens, or a bill that fits neither rate (fast mode, a subagent billed meanwhile), is skipped. The measurement keeps running, so a subscription that runs past its usage limits is seen switching to 5 minutes.
+  - **Set by Claude Code's configuration**, read at session start in the engine's order: `FORCE_PROMPT_CACHING_5M`, `CLAUDE_CODE_PROMPT_CACHE_TTL`, the `promptCacheTtl` setting, `ENABLE_PROMPT_CACHING_1H` (and `ENABLE_PROMPT_CACHING_1H_BEDROCK`), and Bedrock, Vertex or Foundry, which cache for 5 minutes.
+  - **Learned from a pause.** The first request after a pause of 5–60 minutes, or after an unpinged tool that ran that long: one that had to write most of the context again means 5 minutes, one that read it from the cache means 1 hour.
+
+  While the TTL is unknown, the band's hint uses the usage limits: reported and all under 100% suggests 1 hour; none reported, or one past its limit, suggests 5 minutes.
 - **Timing.** The cache lives from the **start** of the last request, not the end of the reply, so the countdown starts there too. A ping renews the cache from the ping's own start.
 - **Ping.** `$.model.fork` resends the conversation's last request with one question after it. It counts as warm only when the API reports at least 70% of the context read from the cache.
 - **Prices.** Prices are the list prices of Claude Code 2.1.295's model catalog, per model, for cache write (5 min and 1 hour), cache read, input and output. An unrecognised model is priced at the $5/M input tier. On a subscription you pay in usage limits rather than dollars, but the ratios are the same.

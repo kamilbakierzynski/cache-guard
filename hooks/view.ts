@@ -34,6 +34,8 @@ export const INITIAL_VIEW: GuardView = {
   toolPings: true,
   notify: true,
   notifyMs: 60_000,
+  learnedTtl: null,
+  ttlSource: null,
   likelyTtl: null,
   model: null,
   isOff: false,
@@ -168,6 +170,31 @@ export const callCost = (
   )
 }
 
+/**
+ * The TTL a request's cache writes were billed at, read from how far it moved the session's cost: a 1-hour write
+ * costs 1.6× a 5-minute one. Null when the request wrote too little to tell, the model's price is not known, or
+ * the amount fits neither (a fast-mode surcharge, another request billed meanwhile). A 10% regional surcharge fits.
+ */
+export const ttlFromBill = (
+  model: string | null,
+  usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number },
+  billed: number,
+): Ttl | null => {
+  if (usage.cache_creation_input_tokens < 500 || billed <= 0) return null
+  const prompt = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+  const cost = cacheCost(model, prompt, null)
+  if (cost.name === null) return null
+  const short = callCost(usage, cost, '5m')
+  const long = callCost(usage, cost, '1h')
+  for (const surcharge of [1, 1.1]) {
+    const slack = 0.25 * surcharge * (long - short)
+    if (Math.abs(billed - surcharge * short) < slack) return '5m'
+    if (Math.abs(billed - surcharge * long) < slack) return '1h'
+  }
+
+  return null
+}
+
 /** What a ping's transcript line reports. */
 export type PingReport = {
   label: string
@@ -255,7 +282,7 @@ export const bandParts = (v: GuardView): BandParts => {
   }
 
   if (v.ttl === null) {
-    const hint = v.likelyTtl === '1h' ? 'a subscription usually has 1 hour' : v.likelyTtl === '5m' ? 'an API key has 5 min' : undefined
+    const hint = v.likelyTtl === '1h' ? 'a subscription usually has 1 hour' : v.likelyTtl === '5m' ? 'an API key or a subscription past its limits has 5 min' : undefined
     return {
       tone: 'warning',
       title: 'Pick the cache TTL',

@@ -26,8 +26,12 @@ type World = {
   executables: string[]
   /** The links the system notifications open on a click. */
   links: string[]
-  /** The desktop app's session id, when the session runs there. */
-  hostSession?: string
+  /** The environment the mod reads. */
+  env: Record<string, string>
+  /** Claude Code's merged settings. */
+  settings: Record<string, unknown>
+  /** The subscription's usage windows; none off a subscription. */
+  rateLimits: { kind: string; percentUsed: number }[]
 }
 
 const MIN = 60_000
@@ -41,7 +45,7 @@ const usage = (read: number, created: number): ModelUsage => ({
 
 /** The engine beneath the mod: a mocked clock and store, and a record of what the mod asked for. */
 function world(on: On, tokens = 100_000) {
-  const w: World = { toasts: [], logs: [], cost: 0, compacts: [], opened: [], forks: 0, isBilled: true, tokens, forkRead: 95_000, notices: [], runs: [], executables: ['powershell.exe'], links: [] }
+  const w: World = { toasts: [], logs: [], cost: 0, compacts: [], opened: [], forks: 0, isBilled: true, tokens, forkRead: 95_000, notices: [], runs: [], executables: ['powershell.exe'], links: [], env: {}, settings: {}, rateLimits: [] }
   const clock = mock.clock(on)
   mock.store(on)
   on('ui.toast', (_$, e) => {
@@ -49,7 +53,8 @@ function world(on: On, tokens = 100_000) {
     return { value: undefined }
   })
   on('ui.status', () => ({ value: undefined }))
-  on('env.get', (_$, e) => ({ value: e.name === 'CLAUDE_CODE_HOST_SESSION_ID' ? w.hostSession : undefined }))
+  on('env.get', (_$, e) => ({ value: w.env[e.name] }))
+  on('settings.read', () => ({ value: w.settings as never }))
   on('process.run', (_$, e) => {
     w.runs.push(`${e.argv[0]}: ${e.init?.env?.CACHE_GUARD_TITLE}`)
     w.links.push(e.init?.env?.CACHE_GUARD_LINK ?? '')
@@ -72,7 +77,7 @@ function world(on: On, tokens = 100_000) {
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.usage', () => ({
-    value: { startedAt: 0, context: { tokens: w.tokens, window: 200_000 }, rateLimits: [], cost: { usd: w.cost } },
+    value: { startedAt: 0, context: { tokens: w.tokens, window: 200_000 }, rateLimits: w.rateLimits, cost: { usd: w.cost } },
   }))
   on('session.compact', (_$, e) => {
     w.compacts.push(e.instructions ?? '')
@@ -267,7 +272,7 @@ describe('cache-guard', () => {
   test('an unknown TTL asks to be picked on the band', { options: { mode: 'compact', ttl: 'auto' } }, async ($, on) => {
     const { w, clock } = world(on)
     await $.turn.complete(turnEnd('t1'))
-    expect(await band($)).toContain("Pick the cache TTL · cache-guard can't time anything until it knows · an API key has 5 min")
+    expect(await band($)).toContain("Pick the cache TTL · cache-guard can't time anything until it knows · an API key or a subscription past its limits has 5 min")
     const mounted = await $.ui.mount({ plugin: 'cache-guard', surface: 'desktop', component: 'AbovePrompt', props: ABOVE_PROMPT })
     expect(JSON.stringify(await mounted.drawn())).toContain('TTL 1 hour')
     await clock.advance(10 * MIN)
@@ -288,7 +293,7 @@ describe('cache-guard', () => {
     await clock.advance(10 * MIN)
     await $.turn.start({ text: 'back', turnId: 't2' })
     await $.turn.complete(turnEnd('t2', 10_000, 98_000))
-    expect(w.toasts).toContain("cache-guard: this session's cache TTL is 5m")
+    expect(w.toasts).toContain("cache-guard: this session's cache TTL is 5m (learned from a pause)")
 
     await clock.advance(4 * MIN + 30_000)
     expect(w.compacts).toHaveLength(1)
@@ -300,7 +305,7 @@ describe('cache-guard', () => {
     await clock.advance(10 * MIN)
     await $.turn.start({ text: 'back', turnId: 't2' })
     await $.turn.complete(turnEnd('t2', 99_000, 2000))
-    expect(w.toasts).toContain("cache-guard: this session's cache TTL is 1h")
+    expect(w.toasts).toContain("cache-guard: this session's cache TTL is 1h (learned from a pause)")
 
     await clock.advance(30 * MIN)
     expect(w.compacts).toEqual([])
@@ -319,7 +324,109 @@ describe('cache-guard', () => {
       context_tokens: 100_000,
       estimated_cache_write_usd: 0,
     } as never)
-    expect(w.toasts).toContain("cache-guard: this session's cache TTL is 1h")
+    expect(w.toasts).toContain("cache-guard: this session's cache TTL is 1h (reported by Claude Code)")
+  })
+
+  /** Main-loop requests that read 100k, write 5k and move the session's cost by `bill()`. */
+  function billedSteps($: Engine, on: On, w: World, bill: () => number) {
+    on('turn.step', async function* (_$, e) {
+      w.cost += bill()
+      return {
+        turnId: e.turnId,
+        index: e.index,
+        answer: '',
+        toolUses: [],
+        stopReason: 'tool_use',
+        usage: { ...usage(100_000, 5000), model: 'claude-opus-5-5' },
+      } as never
+    })
+    return async (index: number) => {
+      const stream = $.turn.step({ turnId: 't1', index, model: 'claude-opus-5-5', messageCount: 3 } as never)
+      for await (const _ of stream);
+    }
+  }
+
+  // Opus 5.5: 50 input at $4, 200 output at $20, 100k read at $0.20, 5k written at $5 (5 min) or $8 (1 hour).
+  const BILL_5M = 0.0492
+  const BILL_1H = 0.0642
+
+  test('auto measures a 1-hour TTL from what two requests\' cache writes cost', { options: { mode: 'compact', ttl: 'auto' } }, async ($, on) => {
+    const { w } = world(on)
+    const step = billedSteps($, on, w, () => BILL_1H)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    await step(0)
+    expect(w.toasts).toEqual([])
+    await step(1)
+    expect(w.toasts).toEqual(["cache-guard: this session's cache TTL is 1h (measured from the cache-write price)"])
+    await $.turn.complete(turnEnd('t1'))
+    expect(await report($)).toContain('TTL: auto (1h, measured from the cache-write price)')
+    expect(await band($)).toContain('1h cache · compact in 60 min')
+  })
+
+  test('auto measures a 5-minute TTL, with a regional surcharge too', { options: { mode: 'compact', ttl: 'auto' } }, async ($, on) => {
+    const { w } = world(on)
+    const step = billedSteps($, on, w, () => BILL_5M * 1.1)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    await step(0)
+    await step(1)
+    expect(w.toasts).toEqual(["cache-guard: this session's cache TTL is 5m (measured from the cache-write price)"])
+  })
+
+  test('a bill that fits neither TTL, or one reading alone, teaches nothing', { options: { mode: 'compact', ttl: 'auto' } }, async ($, on) => {
+    const { w } = world(on)
+    const bills = [BILL_1H, 0.059, BILL_5M, 0.2, BILL_1H]
+    const step = billedSteps($, on, w, () => bills.shift() ?? 0)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    for (let i = 0; i < 5; i++) await step(i)
+    expect(w.toasts).toEqual([])
+  })
+
+  test('the TTL follows the bills when the session changes it', { options: { mode: 'compact', ttl: 'auto' } }, async ($, on) => {
+    const { w } = world(on)
+    let bill = BILL_1H
+    const step = billedSteps($, on, w, () => bill)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    await step(0)
+    await step(1)
+    // Past the usage limits the subscription caches for 5 minutes.
+    bill = BILL_5M
+    await step(2)
+    await step(3)
+    expect(w.toasts.at(-1)).toBe("cache-guard: this session's cache TTL is 5m (measured from the cache-write price)")
+  })
+
+  test('Claude Code\'s configuration sets the TTL from the start', { options: { mode: 'compact', ttl: 'auto' } }, async ($, on) => {
+    const { w } = world(on)
+    w.env.CLAUDE_CODE_PROMPT_CACHE_TTL = '1h'
+    w.settings.promptCacheTtl = '5m'
+    await $.session.start({ cwd: '/tmp', surface: 'desktop', isInteractive: true } as never)
+    await $.turn.complete(turnEnd('t1'))
+    expect(await report($)).toContain('TTL: auto (1h, set by CLAUDE_CODE_PROMPT_CACHE_TTL)')
+    expect(await band($)).not.toContain('Pick the cache TTL')
+  })
+
+  test('the promptCacheTtl setting and the cloud providers set it too', { options: { mode: 'compact', ttl: 'auto' } }, async ($, on) => {
+    const { w } = world(on)
+    w.settings.promptCacheTtl = '1h'
+    await $.session.start({ cwd: '/tmp', surface: 'desktop', isInteractive: true } as never)
+    expect(await report($)).toContain('TTL: auto (1h, set by the promptCacheTtl setting)')
+  })
+
+  test('Bedrock caches for 5 minutes', { options: { mode: 'compact', ttl: 'auto' } }, async ($, on) => {
+    const { w } = world(on)
+    w.env.CLAUDE_CODE_USE_BEDROCK = '1'
+    await $.session.start({ cwd: '/tmp', surface: 'desktop', isInteractive: true } as never)
+    expect(await report($)).toContain('TTL: auto (5m, Bedrock, Vertex and Foundry cache for 5 min)')
+  })
+
+  test('a subscription past its limits likely caches for 5 minutes', { options: { mode: 'compact', ttl: 'auto' } }, async ($, on) => {
+    const { w } = world(on)
+    w.rateLimits = [
+      { kind: 'five_hour', percentUsed: 100 },
+      { kind: 'seven_day', percentUsed: 40 },
+    ]
+    await $.turn.complete(turnEnd('t1'))
+    expect(await band($)).toContain('an API key or a subscription past its limits has 5 min')
   })
 
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -769,7 +876,7 @@ describe('cache-guard', () => {
   test('in the desktop app a click on the notification opens the session', { options: { mode: 'watch', ttl: '5m' } }, async ($, on) => {
     const { w, clock } = world(on)
     w.notifyReason = 'no-surface'
-    w.hostSession = 'local_a4059325-49cd-499c-83bc-dd04b1220ce5'
+    w.env.CLAUDE_CODE_HOST_SESSION_ID = 'local_a4059325-49cd-499c-83bc-dd04b1220ce5'
     await $.session.start({ cwd: '/tmp', surface: 'desktop', isInteractive: true } as never)
     await $.turn.complete(turnEnd('t1'))
     await clock.advance(4 * MIN)
