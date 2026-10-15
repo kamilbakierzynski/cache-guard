@@ -24,6 +24,10 @@ type World = {
   runs: string[]
   /** Executables the host has; the others fail to start. */
   executables: string[]
+  /** The links the system notifications open on a click. */
+  links: string[]
+  /** The desktop app's session id, when the session runs there. */
+  hostSession?: string
 }
 
 const MIN = 60_000
@@ -37,7 +41,7 @@ const usage = (read: number, created: number): ModelUsage => ({
 
 /** The engine beneath the mod: a mocked clock and store, and a record of what the mod asked for. */
 function world(on: On, tokens = 100_000) {
-  const w: World = { toasts: [], logs: [], cost: 0, compacts: [], opened: [], forks: 0, isBilled: true, tokens, forkRead: 95_000, notices: [], runs: [], executables: ['powershell.exe'] }
+  const w: World = { toasts: [], logs: [], cost: 0, compacts: [], opened: [], forks: 0, isBilled: true, tokens, forkRead: 95_000, notices: [], runs: [], executables: ['powershell.exe'], links: [] }
   const clock = mock.clock(on)
   mock.store(on)
   on('ui.toast', (_$, e) => {
@@ -45,8 +49,10 @@ function world(on: On, tokens = 100_000) {
     return { value: undefined }
   })
   on('ui.status', () => ({ value: undefined }))
+  on('env.get', (_$, e) => ({ value: e.name === 'CLAUDE_CODE_HOST_SESSION_ID' ? w.hostSession : undefined }))
   on('process.run', (_$, e) => {
     w.runs.push(`${e.argv[0]}: ${e.init?.env?.CACHE_GUARD_TITLE}`)
+    w.links.push(e.init?.env?.CACHE_GUARD_LINK ?? '')
     if (!w.executables.includes(e.argv[0] ?? '')) throw new Error(`${e.argv[0]}: not found`)
     return { value: { exitCode: 0, stdout: '', stderr: '' } as never }
   })
@@ -758,6 +764,31 @@ describe('cache-guard', () => {
     await $.turn.complete(turnEnd('t2'))
     await clock.advance(4 * MIN)
     expect(w.runs.slice(2)).toEqual(['osascript: Prompt cache expires in 1 min'])
+  })
+
+  test('in the desktop app a click on the notification opens the session', { options: { mode: 'watch', ttl: '5m' } }, async ($, on) => {
+    const { w, clock } = world(on)
+    w.notifyReason = 'no-surface'
+    w.hostSession = 'local_a4059325-49cd-499c-83bc-dd04b1220ce5'
+    await $.session.start({ cwd: '/tmp', surface: 'desktop', isInteractive: true } as never)
+    await $.turn.complete(turnEnd('t1'))
+    await clock.advance(4 * MIN)
+    expect(w.links).toEqual(['claude://code/continue?session=local_a4059325-49cd-499c-83bc-dd04b1220ce5&source=cache-guard'])
+  })
+
+  test('the panel sends a test notification and says how it went', { options: { mode: 'watch', ttl: '5m' } }, async ($, on) => {
+    const { w } = world(on)
+    w.notifyReason = 'no-surface'
+    await $.session.start({ cwd: '/tmp', surface: 'desktop', isInteractive: true } as never)
+    const at = { plugin: 'cache-guard', surface: 'desktop' as const, requestId: 'cache-guard-settings' }
+    await $.ui.mount({ plugin: 'cache-guard', surface: 'desktop', component: 'Pane', requestId: 'cache-guard-settings', props: PANE })
+    await $.ui.press({ ...at, key: 'notify-test' })
+    expect(w.runs).toEqual(['powershell.exe: cache-guard test'])
+    expect(w.links).toEqual([''])
+    expect(w.toasts).toEqual(['cache-guard: test notification sent'])
+    w.notifyReason = 'disabled'
+    await $.ui.press({ ...at, key: 'notify-test' })
+    expect(w.toasts.at(-1)).toBe("cache-guard: no notification: notifications are turned off in Claude Code's settings")
   })
 
   test('notifications turned off in the person\'s settings stay off', { options: { mode: 'watch', ttl: '5m' } }, async ($, on) => {

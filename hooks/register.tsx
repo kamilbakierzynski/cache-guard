@@ -71,6 +71,8 @@ type Guard = Settings & {
   notice?: Timer
   /** Which of the system's own notifiers worked last, where the terminal cannot notify. */
   notifier?: number
+  /** The desktop app's link back to this session, which a click on the notification opens. */
+  link?: string
   /** This session's stats; `stats` holds all sessions'. */
   session: GuardStats
   likelyTtl?: Ttl
@@ -192,10 +194,15 @@ const NOTIFY_STEPPER: Stepper = {
 
 const PING_PROMPT = 'Automated cache keep-alive, not a message from the user. Reply with exactly: ok'
 
-/** A Windows toast from PowerShell's own app id, so nothing has to be installed or registered. */
+/**
+ * A Windows toast from PowerShell's own app id, so nothing has to be installed or registered. With a link, a click
+ * on it opens the link: the desktop app, at this session.
+ */
 const WINDOWS_TOAST =
   '$m=[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime];' +
   '$x=$m::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);' +
+  "if($env:CACHE_GUARD_LINK){$x.DocumentElement.SetAttribute('activationType','protocol');" +
+  "$x.DocumentElement.SetAttribute('launch',$env:CACHE_GUARD_LINK)};" +
   "$t=$x.GetElementsByTagName('text');" +
   '$null=$t.Item(0).AppendChild($x.CreateTextNode($env:CACHE_GUARD_TITLE));' +
   '$null=$t.Item(1).AppendChild($x.CreateTextNode($env:CACHE_GUARD_BODY));' +
@@ -433,15 +440,30 @@ async function notify($: EngineInterface, g: Guard) {
   const body = isCompact
     ? `cache-guard compacts ${kTokens(g.context)} before the cache expires. Reply before then to keep the full context.`
     : `The next reply then re-writes ${kTokens(g.context)}: ≈ ${usdText(cost.cold)} instead of ${usdText(cost.warm)}.`
+  await raise($, g, title, body)
+}
+
+/** Raises a notification; says whether it went out, or why not. */
+async function raise($: EngineInterface, g: Guard, title: string, body: string): Promise<string | null> {
   const sent = await $.ui.notify(body, { title }).catch(() => ({ isSent: false as const, reason: 'refused' as const }))
+  if (sent.isSent) return null
+  if (sent.reason === 'disabled') return "notifications are turned off in Claude Code's settings"
+  if (sent.reason === 'refused') return 'a Notification hook refused it'
   // No terminal to notify through (the desktop app), or none that notifies: the system's own notification
   // reaches the person in another session or another window too.
-  if (!sent.isSent && (sent.reason === 'no-surface' || sent.reason === 'no-channel')) await nativeNotify($, g, title, body)
+  return (await nativeNotify($, g, title, body)) ? null : 'the system has no notifier cache-guard can run'
+}
+
+/** The Notification section's button: one notification now, to see that it arrives and where a click leads. */
+async function testNotify($: EngineInterface, g: Guard) {
+  const body = g.link ? 'Notifications work. Click this one to come back to the session.' : 'Notifications work.'
+  const failure = await raise($, g, 'cache-guard test', body)
+  $.ui.toast(failure ? `cache-guard: no notification: ${failure}` : 'cache-guard: test notification sent')
 }
 
 /** Raises the notification with the first of the system's notifiers that works, starting with the last one that did. */
-async function nativeNotify($: EngineInterface, g: Guard, title: string, body: string) {
-  const env = { CACHE_GUARD_TITLE: title, CACHE_GUARD_BODY: body }
+async function nativeNotify($: EngineInterface, g: Guard, title: string, body: string): Promise<boolean> {
+  const env = { CACHE_GUARD_TITLE: title, CACHE_GUARD_BODY: body, CACHE_GUARD_LINK: g.link ?? '' }
   const order = NATIVE_NOTIFIERS.map((make, i) => ({ make, i }))
   order.sort((a, b) => Number(b.i === g.notifier) - Number(a.i === g.notifier))
   for (const { make, i } of order) {
@@ -451,9 +473,11 @@ async function nativeNotify($: EngineInterface, g: Guard, title: string, body: s
       .catch(() => false)
     if (isShown) {
       g.notifier = i
-      return
+      return true
     }
   }
+
+  return false
 }
 
 /** Starts guarding a cache touched at `at`. */
@@ -695,6 +719,9 @@ async function setInstruction($: EngineInterface, g: Guard, profile: GuardProfil
 }
 
 async function restore($: EngineInterface, g: Guard) {
+  // The desktop app names its session; its claude:// link opens the app at it.
+  const host = await $.env.get('CLAUDE_CODE_HOST_SESSION_ID')
+  g.link = host && /^local_[A-Za-z0-9-]{1,64}$/.test(host) ? `claude://code/continue?session=${host}&source=cache-guard` : undefined
   Object.assign(g, settingsFrom((await $.store.get('settings')) ?? {}, settingsOf(g)))
   await loadInstructions($, g)
   g.learnedTtl = asTtl(await $.store.get('learnedTtl'))
@@ -1087,6 +1114,14 @@ export const register: Register = (on, options) => {
           </Box>
         </Box>
         {v.notify ? stepRow(NOTIFY_STEPPER) : null}
+        <Box {...row}>
+          <Text dimColor>
+            {g.link
+              ? 'On Windows a click on the notification brings you back to this session.'
+              : 'Check that notifications reach you.'}
+          </Text>
+          <Button key="notify-test" label="Send a test" onPress={() => testNotify($, g)} />
+        </Box>
 
         <Text bold>Compaction</Text>
         <Box {...row}>

@@ -103,6 +103,10 @@ A minute before the cache lapses (adjustable from 30 s to 10 min), you get a sys
 
 In a terminal it goes through Claude Code's own notification channel (`preferredNotifChannel`). The Claude desktop app has no terminal to notify through, so there cache-guard raises the system's own notification instead: a Windows toast through PowerShell, `osascript` on macOS, `notify-send` on Linux. Nothing has to be installed. If you have turned Claude Code's notifications off, cache-guard sends none.
 
+In the desktop app on Windows, **a click on the notification brings you back to the session** it is about, even from another session: it opens the app's `claude://code/continue?session=…` link. On macOS and Linux the notification shows, but the system's built-in notifier cannot carry a link.
+
+**Send a test** in the panel's Notification section raises one at once, and says under the prompt whether it went out or why not.
+
 ### The settings panel
 
 Open it with **⚙ Settings** on the band or with the `/cache-guard` command. The command also prints a report: the current state, the price at your model, and the stats.
@@ -112,7 +116,7 @@ Open it with **⚙ Settings** on the band or with the `/cache-guard` command. Th
 - **Pings before compact.** 0–10, then ∞. At ∞ the panel says what an idle hour of pinging costs at your context and after how long that exceeds one re-cache.
 - **Act before expiry.** 10–180 s.
 - **Minimum context.** 10k–500k.
-- **Notification.** Turn the notification before expiry on or off, and set how early it comes: 30 s – 10 min.
+- **Notification.** Turn the notification before expiry on or off, set how early it comes (30 s – 10 min), and send a test.
 - **Compaction.** Pick the instruction profile and **edit its prompt in place**: type, then Enter to save. **Restore default** or an empty field brings back the default text. Edits are kept across sessions.
 - **Cost.** The price of your next reply on a warm and on an expired cache, at your model's list price.
 - **Savings.** This session and all sessions: lapses avoided, re-caching spared, money spent on pings and compactions, and the net.
